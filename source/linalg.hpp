@@ -16,6 +16,10 @@ inline float radians(float degrees) {
 	return degrees * (pi / 180.0f);
 }
 
+inline float degrees(float radians) {
+	return radians * (180.0f / pi);
+}
+
 struct Vec3 {
 	float x = 0.0f;
 	float y = 0.0f;

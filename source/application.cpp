@@ -31,6 +31,7 @@ struct Vertex {
 // Данные, которые шейдер получает напрямую из командного буфера.
 struct PushConstants {
 	Mat4 mvp;
+	float tint[4]; // цвет из интерфейса, на него домножается цвет вершины
 };
 
 constexpr uint32_t icosahedron_corner_count = 12; // уникальных вершин тела
@@ -105,6 +106,21 @@ bool auto_rotate = true;
 float auto_rotate_speed = 30.0f; // градусов в секунду
 float auto_rotate_angle = 0.0f;
 
+// Движение по траектории: фигура летит по замкнутой кривой Лиссажу и
+// одновременно поворачивается. Пауза, скорость и параметры кривой задаются
+// в интерфейсе.
+bool animation_playing = true;
+float animation_time = 0.0f;      // параметр кривой, растёт только при проигрывании
+float animation_speed = 0.6f;     // во сколько раз быстрее базовой скорости
+float trajectory_radius = 0.9f;   // радиус по горизонтали
+float trajectory_height = 0.45f;  // амплитуда по вертикали
+float trajectory_depth = 0.6f;    // амплитуда по глубине
+int trajectory_lobes = 2;         // число лепестков кривой по вертикали
+bool trajectory_turn = true;      // доворачивать фигуру по ходу движения
+
+// Цвет фигуры из интерфейса. На него умножается процедурный цвет вершины.
+float object_tint[3] = {1.0f, 1.0f, 1.0f};
+
 double previous_time = 0.0;
 
 // Матрица, посчитанная в update() и использованная в render().
@@ -113,11 +129,14 @@ Mat4 mvp = linalg::identity();
 // Вершинный буфер строится из таблицы координат и таблицы граней.
 //
 // Каждая грань получает собственные три вершины (20 * 3 = 60 штук), хотя
-// геометрически вершин всего 12. Это нужно, чтобы задать свой цвет для каждой
-// грани: соседние грани не могут делить одну вершину с разными цветами.
-// Цвет назначается процедурно -- по направлению на центр грани в локальной
-// системе координат фигуры. Без этого однотонный икосаэдр без освещения
-// выглядел бы плоским силуэтом.
+// геометрически вершин всего 12. Это нужно, чтобы соседние грани могли задать
+// разный цвет в общей точке.
+//
+// Цвет вершины назначается процедурно -- по её позиции в локальной системе
+// координат фигуры, с добавкой направления на центр грани. Без этой добавки
+// соседние грани получали бы в общих вершинах одинаковый цвет, переходы между
+// гранями исчезли бы, и без освещения фигура выглядела бы однотонным пятном.
+// В шейдере этот цвет умножается на цвет, выбранный в интерфейсе.
 void buildVertices(Vertex (&out_vertices)[icosahedron_vertex_count]) {
 	for (uint32_t face = 0; face < icosahedron_face_count; ++face) {
 		Vec3 positions[3];
@@ -130,13 +149,15 @@ void buildVertices(Vertex (&out_vertices)[icosahedron_vertex_count]) {
 		}
 
 		const Vec3 normal = linalg::normalize(center);
-		const Vec3 color = {
-			0.5f + 0.5f * normal.x,
-			0.5f + 0.5f * normal.y,
-			0.5f + 0.5f * normal.z,
-		};
 
 		for (uint32_t i = 0; i < 3; ++i) {
+			const Vec3 direction = linalg::normalize(positions[i] * 0.6f + normal * 0.4f);
+			const Vec3 color = {
+				0.5f + 0.5f * direction.x,
+				0.5f + 0.5f * direction.y,
+				0.5f + 0.5f * direction.z,
+			};
+
 			out_vertices[face * 3 + i] = {positions[i], color};
 		}
 	}
@@ -167,10 +188,10 @@ bool createPipeline() {
 		return false;
 	}
 
-	// Матрица MVP передаётся через push-константы: 64 байта из гарантированных
-	// спецификацией 128, так что набор дескрипторов для неё не нужен.
+	// Матрица MVP и цвет передаются через push-константы: 80 байт из
+	// гарантированных спецификацией 128, так что набор дескрипторов не нужен.
 	const VkPushConstantRange push_constant_range = {
-		.stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
+		.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
 		.offset = 0,
 		.size = sizeof(PushConstants),
 	};
@@ -320,13 +341,39 @@ bool createPipeline() {
 	return ok;
 }
 
+// Точка траектории: кривая Лиссажу в трёх измерениях. При lobes = 1 это
+// наклонный эллипс, при lobes = 2 -- "восьмёрка", дальше -- более сложные петли.
+Vec3 trajectoryPoint(float t) {
+	return {
+		trajectory_radius * std::cos(t),
+		trajectory_height * std::sin(static_cast<float>(trajectory_lobes) * t),
+		trajectory_depth * std::sin(t),
+	};
+}
+
 // M = T * Rz * Ry * Rx * S -- сначала масштаб, затем повороты, затем перенос.
 Mat4 modelMatrix() {
+	Vec3 position = object_position;
+	float extra_yaw = auto_rotate_angle;
+
+	if (animation_playing || animation_time != 0.0f) {
+		const Vec3 point = trajectoryPoint(animation_time);
+		position = position + point;
+
+		if (trajectory_turn) {
+			// Фигура доворачивается по направлению движения: направление --
+			// это разность двух близких точек траектории.
+			const Vec3 ahead = trajectoryPoint(animation_time + 0.05f);
+			const Vec3 velocity = ahead - point;
+			extra_yaw += linalg::degrees(std::atan2(velocity.x, velocity.z));
+		}
+	}
+
 	const Mat4 rotation = linalg::rotationZ(linalg::radians(object_rotation.z)) *
-	                      linalg::rotationY(linalg::radians(object_rotation.y + auto_rotate_angle)) *
+	                      linalg::rotationY(linalg::radians(object_rotation.y + extra_yaw)) *
 	                      linalg::rotationX(linalg::radians(object_rotation.x));
 
-	return linalg::translation(object_position) * rotation * linalg::scaling(object_scale);
+	return linalg::translation(position) * rotation * linalg::scaling(object_scale);
 }
 
 Mat4 projectionMatrix() {
@@ -377,11 +424,35 @@ void drawInterface() {
 	ImGui::SameLine();
 	ImGui::SliderFloat("deg/s", &auto_rotate_speed, -180.0f, 180.0f, "%.0f");
 
+	ImGui::SeparatorText("Animation");
+	if (ImGui::Button(animation_playing ? "Pause" : "Play")) {
+		animation_playing = !animation_playing;
+	}
+	ImGui::SameLine();
+	if (ImGui::Button("Stop")) {
+		animation_playing = false;
+		animation_time = 0.0f;
+	}
+	ImGui::SliderFloat("animation speed", &animation_speed, 0.0f, 3.0f, "%.2f");
+	ImGui::SliderFloat("trajectory radius", &trajectory_radius, 0.0f, 2.0f, "%.2f");
+	ImGui::SliderFloat("trajectory height", &trajectory_height, 0.0f, 1.5f, "%.2f");
+	ImGui::SliderFloat("trajectory depth", &trajectory_depth, 0.0f, 2.0f, "%.2f");
+	ImGui::SliderInt("trajectory lobes", &trajectory_lobes, 1, 5);
+	ImGui::Checkbox("turn along the path", &trajectory_turn);
+
+	ImGui::SeparatorText("Colour");
+	ImGui::ColorEdit3("tint", object_tint);
+	ImGui::TextWrapped("Vertex colours are generated from vertex positions and "
+	                   "multiplied by this colour in the shader.");
+
+	ImGui::Separator();
 	if (ImGui::Button("Reset")) {
 		object_position = {0.0f, 0.0f, 0.0f};
 		object_rotation = {0.0f, 0.0f, 0.0f};
 		object_scale = {1.0f, 1.0f, 1.0f};
 		auto_rotate_angle = 0.0f;
+		animation_time = 0.0f;
+		object_tint[0] = object_tint[1] = object_tint[2] = 1.0f;
 	}
 
 	ImGui::End();
@@ -412,6 +483,13 @@ void update(double time) {
 	previous_time = time;
 
 	drawInterface();
+
+	if (animation_playing) {
+		animation_time += animation_speed * delta_time;
+		if (animation_time > 2.0f * linalg::pi * 100.0f) {
+			animation_time = 0.0f;
+		}
+	}
 
 	if (auto_rotate) {
 		auto_rotate_angle += auto_rotate_speed * delta_time;
@@ -477,8 +555,12 @@ void render(const graphics::internal::FrameData& fd) {
 	};
 	vkCmdSetScissor(cmd, 0, 1, &scissor);
 
-	const PushConstants push_constants = {.mvp = mvp};
-	vkCmdPushConstants(cmd, vk_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
+	const PushConstants push_constants = {
+		.mvp = mvp,
+		.tint = {object_tint[0], object_tint[1], object_tint[2], 1.0f},
+	};
+	vkCmdPushConstants(cmd, vk_pipeline_layout,
+	                   VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
 	                   sizeof(push_constants), &push_constants);
 
 	const VkDeviceSize vertex_buffer_offset = 0;
