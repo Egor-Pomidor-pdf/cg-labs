@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <iostream>
 
 #include <imgui.h>
 
@@ -28,10 +29,29 @@ struct Vertex {
 	Vec3 color;
 };
 
-// Данные, которые шейдер получает напрямую из командного буфера.
-struct PushConstants {
-	Mat4 mvp;
+// Данные сцены: одинаковы для всех объектов кадра. Лежат в наборе
+// дескрипторов 0, который привязывается один раз за кадр.
+struct SceneUniforms {
+	Mat4 view;
+	Mat4 projection;
+};
+
+// Данные одного объекта. Лежат в наборе дескрипторов 1 -- у каждой фигуры он
+// свой, и перед её отрисовкой привязывается именно он.
+struct ObjectUniforms {
+	Mat4 model;
 	float tint[4]; // цвет из интерфейса, на него домножается цвет вершины
+};
+
+// Сколько фигур можно нарисовать одновременно: столько же наборов
+// дескрипторов выделяется при запуске.
+constexpr uint32_t max_objects = 4;
+
+// Параметры фигуры, которыми управляет интерфейс.
+struct ObjectParams {
+	float tint[3];
+	float scale;  // множитель к общему растяжению
+	float phase;  // сдвиг по траектории, радианы
 };
 
 constexpr uint32_t icosahedron_corner_count = 12; // уникальных вершин тела
@@ -118,13 +138,31 @@ float trajectory_depth = 0.6f;    // амплитуда по глубине
 int trajectory_lobes = 2;         // число лепестков кривой по вертикали
 bool trajectory_turn = true;      // доворачивать фигуру по ходу движения
 
-// Цвет фигуры из интерфейса. На него умножается процедурный цвет вершины.
-float object_tint[3] = {1.0f, 1.0f, 1.0f};
+// Фигуры на сцене. Все летят по одной траектории, но с разным сдвигом,
+// размером и цветом.
+int object_count = 3;
+ObjectParams objects[max_objects] = {
+	{{1.0f, 1.0f, 1.0f}, 1.00f, 0.0f},
+	{{1.0f, 0.5f, 0.3f}, 0.60f, 2.1f},
+	{{0.4f, 0.8f, 1.0f}, 0.45f, 4.2f},
+	{{0.6f, 1.0f, 0.5f}, 0.35f, 1.0f},
+};
 
 double previous_time = 0.0;
 
-// Матрица, посчитанная в update() и использованная в render().
-Mat4 mvp = linalg::identity();
+// Данные, посчитанные в update() и записанные в буферы в render().
+SceneUniforms scene_uniforms;
+ObjectUniforms object_uniforms[max_objects];
+
+// Наборы дескрипторов и буферы под них.
+graphics::Buffer scene_uniform_buffer;
+graphics::Buffer object_uniform_buffers[max_objects];
+
+VkDescriptorSetLayout vk_scene_set_layout = VK_NULL_HANDLE;
+VkDescriptorSetLayout vk_object_set_layout = VK_NULL_HANDLE;
+VkDescriptorPool vk_descriptor_pool = VK_NULL_HANDLE;
+VkDescriptorSet vk_scene_set = VK_NULL_HANDLE;
+VkDescriptorSet vk_object_sets[max_objects] = {};
 
 // Вершинный буфер строится из таблицы координат и таблицы граней.
 //
@@ -177,6 +215,155 @@ bool createGeometry() {
 	return true;
 }
 
+// Два набора дескрипторов: общий для сцены и отдельный для каждой фигуры.
+// Благодаря этому view и projection записываются один раз за кадр, а перед
+// отрисовкой каждой фигуры меняется только её собственный набор.
+bool createDescriptors() {
+	auto& context = graphics::internal::context;
+
+	if (!graphics::createHostVisibleBuffer(sizeof(SceneUniforms),
+	                                       VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+	                                       scene_uniform_buffer)) {
+		return false;
+	}
+
+	for (uint32_t i = 0; i < max_objects; ++i) {
+		if (!graphics::createHostVisibleBuffer(sizeof(ObjectUniforms),
+		                                       VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+		                                       object_uniform_buffers[i])) {
+			return false;
+		}
+	}
+
+	// Описание набора 0: один буфер, который читает вершинный шейдер.
+	const VkDescriptorSetLayoutBinding scene_binding = {
+		.binding = 0,
+		.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+		.descriptorCount = 1,
+		.stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
+	};
+
+	const VkDescriptorSetLayoutCreateInfo scene_set_layout = {
+		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+		.bindingCount = 1,
+		.pBindings = &scene_binding,
+	};
+
+	if (vkCreateDescriptorSetLayout(context.device, &scene_set_layout, nullptr,
+	                                &vk_scene_set_layout) != VK_SUCCESS) {
+		std::cerr << "Failed to create Vulkan descriptor set layout for scene data\n";
+		return false;
+	}
+
+	// Описание набора 1: цвет нужен и фрагментному шейдеру тоже.
+	const VkDescriptorSetLayoutBinding object_binding = {
+		.binding = 0,
+		.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+		.descriptorCount = 1,
+		.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+	};
+
+	const VkDescriptorSetLayoutCreateInfo object_set_layout = {
+		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+		.bindingCount = 1,
+		.pBindings = &object_binding,
+	};
+
+	if (vkCreateDescriptorSetLayout(context.device, &object_set_layout, nullptr,
+	                                &vk_object_set_layout) != VK_SUCCESS) {
+		std::cerr << "Failed to create Vulkan descriptor set layout for object data\n";
+		return false;
+	}
+
+	// Пул, из которого выделяются наборы: один для сцены и по одному на фигуру.
+	const VkDescriptorPoolSize pool_size = {
+		.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+		.descriptorCount = 1 + max_objects,
+	};
+
+	const VkDescriptorPoolCreateInfo descriptor_pool = {
+		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+		.maxSets = 1 + max_objects,
+		.poolSizeCount = 1,
+		.pPoolSizes = &pool_size,
+	};
+
+	if (vkCreateDescriptorPool(context.device, &descriptor_pool, nullptr,
+	                           &vk_descriptor_pool) != VK_SUCCESS) {
+		std::cerr << "Failed to create Vulkan descriptor pool\n";
+		return false;
+	}
+
+	const VkDescriptorSetAllocateInfo scene_allocation = {
+		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+		.descriptorPool = vk_descriptor_pool,
+		.descriptorSetCount = 1,
+		.pSetLayouts = &vk_scene_set_layout,
+	};
+
+	if (vkAllocateDescriptorSets(context.device, &scene_allocation, &vk_scene_set) != VK_SUCCESS) {
+		std::cerr << "Failed to allocate Vulkan descriptor set for scene data\n";
+		return false;
+	}
+
+	VkDescriptorSetLayout object_layouts[max_objects];
+	for (uint32_t i = 0; i < max_objects; ++i) {
+		object_layouts[i] = vk_object_set_layout;
+	}
+
+	const VkDescriptorSetAllocateInfo object_allocation = {
+		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+		.descriptorPool = vk_descriptor_pool,
+		.descriptorSetCount = max_objects,
+		.pSetLayouts = object_layouts,
+	};
+
+	if (vkAllocateDescriptorSets(context.device, &object_allocation,
+	                             vk_object_sets) != VK_SUCCESS) {
+		std::cerr << "Failed to allocate Vulkan descriptor sets for objects\n";
+		return false;
+	}
+
+	// Наборы связываются с буферами один раз: сами буферы потом не меняются,
+	// меняется только их содержимое.
+	VkDescriptorBufferInfo buffer_infos[1 + max_objects];
+	VkWriteDescriptorSet writes[1 + max_objects];
+
+	buffer_infos[0] = {
+		.buffer = scene_uniform_buffer.handle,
+		.offset = 0,
+		.range = sizeof(SceneUniforms),
+	};
+	writes[0] = {
+		.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+		.dstSet = vk_scene_set,
+		.dstBinding = 0,
+		.descriptorCount = 1,
+		.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+		.pBufferInfo = &buffer_infos[0],
+	};
+
+	for (uint32_t i = 0; i < max_objects; ++i) {
+		buffer_infos[1 + i] = {
+			.buffer = object_uniform_buffers[i].handle,
+			.offset = 0,
+			.range = sizeof(ObjectUniforms),
+		};
+		writes[1 + i] = {
+			.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+			.dstSet = vk_object_sets[i],
+			.dstBinding = 0,
+			.descriptorCount = 1,
+			.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+			.pBufferInfo = &buffer_infos[1 + i],
+		};
+	}
+
+	vkUpdateDescriptorSets(context.device, 1 + max_objects, writes, 0, nullptr);
+
+	return true;
+}
+
 bool createPipeline() {
 	auto& context = graphics::internal::context;
 
@@ -188,18 +375,17 @@ bool createPipeline() {
 		return false;
 	}
 
-	// Матрица MVP и цвет передаются через push-константы: 80 байт из
-	// гарантированных спецификацией 128, так что набор дескрипторов не нужен.
-	const VkPushConstantRange push_constant_range = {
-		.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-		.offset = 0,
-		.size = sizeof(PushConstants),
+	// Конвейер ожидает два набора дескрипторов: нулевой -- данные сцены,
+	// первый -- данные конкретной фигуры.
+	const VkDescriptorSetLayout set_layouts[] = {
+		vk_scene_set_layout,
+		vk_object_set_layout,
 	};
 
 	const VkPipelineLayoutCreateInfo pipeline_layout = {
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-		.pushConstantRangeCount = 1,
-		.pPushConstantRanges = &push_constant_range,
+		.setLayoutCount = 2,
+		.pSetLayouts = set_layouts,
 	};
 
 	bool ok = vkCreatePipelineLayout(context.device, &pipeline_layout, nullptr,
@@ -352,18 +538,22 @@ Vec3 trajectoryPoint(float t) {
 }
 
 // M = T * Rz * Ry * Rx * S -- сначала масштаб, затем повороты, затем перенос.
-Mat4 modelMatrix() {
+// Каждая фигура идёт по той же траектории со своим сдвигом и размером.
+Mat4 modelMatrix(int object_index) {
+	const ObjectParams& params = objects[object_index];
+	const float time = animation_time + params.phase;
+
 	Vec3 position = object_position;
 	float extra_yaw = auto_rotate_angle;
 
 	if (animation_playing || animation_time != 0.0f) {
-		const Vec3 point = trajectoryPoint(animation_time);
+		const Vec3 point = trajectoryPoint(time);
 		position = position + point;
 
 		if (trajectory_turn) {
 			// Фигура доворачивается по направлению движения: направление --
 			// это разность двух близких точек траектории.
-			const Vec3 ahead = trajectoryPoint(animation_time + 0.05f);
+			const Vec3 ahead = trajectoryPoint(time + 0.05f);
 			const Vec3 velocity = ahead - point;
 			extra_yaw += linalg::degrees(std::atan2(velocity.x, velocity.z));
 		}
@@ -373,7 +563,9 @@ Mat4 modelMatrix() {
 	                      linalg::rotationY(linalg::radians(object_rotation.y + extra_yaw)) *
 	                      linalg::rotationX(linalg::radians(object_rotation.x));
 
-	return linalg::translation(position) * rotation * linalg::scaling(object_scale);
+	const Vec3 scale = object_scale * params.scale;
+
+	return linalg::translation(position) * rotation * linalg::scaling(scale);
 }
 
 Mat4 projectionMatrix() {
@@ -400,6 +592,7 @@ void drawInterface() {
 	ImGui::Text("%.1f FPS", static_cast<double>(ImGui::GetIO().Framerate));
 	ImGui::Text("%u faces, %u vertices in the buffer (%u distinct corners)",
 	            icosahedron_face_count, icosahedron_vertex_count, icosahedron_corner_count);
+	ImGui::Text("%d objects, %d descriptor sets bound per frame", object_count, object_count + 1);
 
 	ImGui::SeparatorText("Projection");
 	int projection = use_perspective ? 0 : 1;
@@ -440,10 +633,20 @@ void drawInterface() {
 	ImGui::SliderInt("trajectory lobes", &trajectory_lobes, 1, 5);
 	ImGui::Checkbox("turn along the path", &trajectory_turn);
 
-	ImGui::SeparatorText("Colour");
-	ImGui::ColorEdit3("tint", object_tint);
-	ImGui::TextWrapped("Vertex colours are generated from vertex positions and "
-	                   "multiplied by this colour in the shader.");
+	ImGui::SeparatorText("Objects");
+	ImGui::SliderInt("object count", &object_count, 1, static_cast<int>(max_objects));
+	ImGui::TextWrapped("Every object has its own descriptor set with its own model "
+	                   "matrix and colour; vertex colours are generated from vertex "
+	                   "positions and multiplied by that colour in the shader.");
+
+	for (int i = 0; i < object_count; ++i) {
+		ImGui::PushID(i);
+		ImGui::Text("object %d", i + 1);
+		ImGui::ColorEdit3("tint", objects[i].tint);
+		ImGui::SliderFloat("size", &objects[i].scale, 0.1f, 1.5f, "%.2f");
+		ImGui::SliderFloat("path offset", &objects[i].phase, 0.0f, 6.28f, "%.2f");
+		ImGui::PopID();
+	}
 
 	ImGui::Separator();
 	if (ImGui::Button("Reset")) {
@@ -452,7 +655,6 @@ void drawInterface() {
 		object_scale = {1.0f, 1.0f, 1.0f};
 		auto_rotate_angle = 0.0f;
 		animation_time = 0.0f;
-		object_tint[0] = object_tint[1] = object_tint[2] = 1.0f;
 	}
 
 	ImGui::End();
@@ -461,7 +663,7 @@ void drawInterface() {
 } // namespace
 
 bool initialize() {
-	if (!createGeometry()) {
+	if (!createGeometry() || !createDescriptors()) {
 		return false;
 	}
 
@@ -474,6 +676,16 @@ void shutdown() {
 
 	vkDestroyPipeline(context.device, vk_pipeline, nullptr);
 	vkDestroyPipelineLayout(context.device, vk_pipeline_layout, nullptr);
+
+	// Наборы дескрипторов уничтожаются вместе с пулом, из которого выделены.
+	vkDestroyDescriptorPool(context.device, vk_descriptor_pool, nullptr);
+	vkDestroyDescriptorSetLayout(context.device, vk_object_set_layout, nullptr);
+	vkDestroyDescriptorSetLayout(context.device, vk_scene_set_layout, nullptr);
+
+	for (uint32_t i = 0; i < max_objects; ++i) {
+		graphics::destroyBuffer(object_uniform_buffers[i]);
+	}
+	graphics::destroyBuffer(scene_uniform_buffer);
 
 	graphics::destroyBuffer(vertex_buffer);
 }
@@ -499,11 +711,18 @@ void update(double time) {
 	}
 
 	// Камера смотрит в начало координат с положительной полуоси Z.
-	const Mat4 view = linalg::lookAt({0.0f, 0.0f, camera_distance},
-	                                 {0.0f, 0.0f, 0.0f},
-	                                 {0.0f, 1.0f, 0.0f});
+	scene_uniforms.view = linalg::lookAt({0.0f, 0.0f, camera_distance},
+	                                     {0.0f, 0.0f, 0.0f},
+	                                     {0.0f, 1.0f, 0.0f});
+	scene_uniforms.projection = projectionMatrix();
 
-	mvp = projectionMatrix() * view * modelMatrix();
+	for (int i = 0; i < object_count; ++i) {
+		object_uniforms[i].model = modelMatrix(i);
+		object_uniforms[i].tint[0] = objects[i].tint[0];
+		object_uniforms[i].tint[1] = objects[i].tint[1];
+		object_uniforms[i].tint[2] = objects[i].tint[2];
+		object_uniforms[i].tint[3] = 1.0f;
+	}
 }
 
 void render(const graphics::internal::FrameData& fd) {
@@ -518,6 +737,15 @@ void render(const graphics::internal::FrameData& fd) {
 		.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
 	};
 	vkBeginCommandBuffer(cmd, &begin_info);
+
+	// Данные кадра пишутся здесь, а не в update(): к этому моменту
+	// graphics::internal::prepare() уже дождался, пока видеокарта закончит
+	// предыдущий кадр, поэтому эти буферы можно безопасно перезаписывать.
+	graphics::writeBuffer(scene_uniform_buffer, &scene_uniforms, sizeof(scene_uniforms));
+	for (int i = 0; i < object_count; ++i) {
+		graphics::writeBuffer(object_uniform_buffers[i], &object_uniforms[i],
+		                      sizeof(ObjectUniforms));
+	}
 
 	// 2. The values used to clear the color and depth images
 	const VkClearValue clear_values[] = {
@@ -555,18 +783,21 @@ void render(const graphics::internal::FrameData& fd) {
 	};
 	vkCmdSetScissor(cmd, 0, 1, &scissor);
 
-	const PushConstants push_constants = {
-		.mvp = mvp,
-		.tint = {object_tint[0], object_tint[1], object_tint[2], 1.0f},
-	};
-	vkCmdPushConstants(cmd, vk_pipeline_layout,
-	                   VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
-	                   sizeof(push_constants), &push_constants);
+	// Набор 0 одинаков для всей сцены, поэтому привязывается один раз.
+	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk_pipeline_layout,
+	                        0, 1, &vk_scene_set, 0, nullptr);
 
 	const VkDeviceSize vertex_buffer_offset = 0;
 	vkCmdBindVertexBuffers(cmd, 0, 1, &vertex_buffer.handle, &vertex_buffer_offset);
 
-	vkCmdDraw(cmd, icosahedron_vertex_count, 1, 0, 0);
+	// Фигуры делят одну и ту же геометрию: перед каждой меняется только её
+	// собственный набор дескрипторов с матрицей модели и цветом.
+	for (int i = 0; i < object_count; ++i) {
+		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk_pipeline_layout,
+		                        1, 1, &vk_object_sets[i], 0, nullptr);
+
+		vkCmdDraw(cmd, icosahedron_vertex_count, 1, 0, 0);
+	}
 
 	// 5. Finish
 	vkCmdEndRenderPass(cmd);
