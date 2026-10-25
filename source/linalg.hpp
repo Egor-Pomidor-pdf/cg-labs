@@ -124,6 +124,38 @@ inline Mat4 rotationZ(float angle) {
 	return m;
 }
 
+// Матрица для нормалей: обратная транспонированная к блоку 3x3 матрицы модели.
+// Если фигуру растянуть неравномерно, то нормали, умноженные на саму model,
+// перестают быть перпендикулярны поверхности, а на эту матрицу -- остаются.
+inline Mat4 normalMatrix(const Mat4& m) {
+	const float a = m.c[0][0], b = m.c[1][0], c = m.c[2][0];
+	const float d = m.c[0][1], e = m.c[1][1], f = m.c[2][1];
+	const float g = m.c[0][2], h = m.c[1][2], i = m.c[2][2];
+
+	// Матрица алгебраических дополнений. Обратная матрица равна её
+	// транспонированной, поделённой на определитель, а нам нужна обратная
+	// транспонированная -- то есть сама матрица дополнений, делённая на него.
+	const float cofactors[3][3] = {
+		{   e * i - f * h, -(d * i - f * g),   d * h - e * g},
+		{-(b * i - c * h),   a * i - c * g, -(a * h - b * g)},
+		{   b * f - c * e, -(a * f - c * d),   a * e - b * d},
+	};
+
+	const float det = a * cofactors[0][0] + b * cofactors[0][1] + c * cofactors[0][2];
+
+	Mat4 r = identity();
+	if (det == 0.0f) {
+		return r; // вырожденный масштаб (ноль по какой-то оси)
+	}
+
+	for (int row = 0; row < 3; ++row) {
+		for (int column = 0; column < 3; ++column) {
+			r.c[column][row] = cofactors[row][column] / det;
+		}
+	}
+	return r;
+}
+
 // --- Camera and projections -------------------------------------------------
 
 // Right-handed view matrix: the camera sits in `eye` and looks at `target`.

@@ -1,15 +1,16 @@
-// Лабораторная работа №1 -- Основы 3D-графики
+// Лабораторная работа №2 -- Камера и освещение
 // Вариант 11: правильный икосаэдр
 //
-// Икосаэдр задаётся таблицей из 12 вершин и таблицей из 20 треугольных граней
-// и рисуется в реальном времени с тестом глубины. Матрица model-view-projection
-// пересчитывается каждый кадр на CPU и передаётся в вершинный шейдер через
-// push-константы.
+// Базовая часть: фигура из первой лабораторной рисуется относительно камеры,
+// которой можно задать позицию, поворот и угол обзора, и освещается одним
+// направленным источником по модели Блинн-Фонга. Параметры камеры, источника,
+// рассеянного света и материала задаются из интерфейса.
 
 #include "application.hpp"
 
 #include <cstdint>
 #include <cstddef>
+#include <iostream>
 
 #include <imgui.h>
 
@@ -23,14 +24,24 @@ namespace {
 using linalg::Mat4;
 using linalg::Vec3;
 
+// Кроме позиции у вершины задана нормаль -- без неё освещение не посчитать.
 struct Vertex {
 	Vec3 position;
-	Vec3 color;
+	Vec3 normal;
 };
 
-// Данные, которые шейдер получает напрямую из командного буфера.
-struct PushConstants {
-	Mat4 mvp;
+// Внешние данные шейдеров. Все поля выровнены по 16 байт (vec4 вместо vec3),
+// как того требует раскладка std140 для uniform-буфера.
+struct Uniforms {
+	Mat4 model;
+	Mat4 view_projection;
+	Mat4 normal_matrix;
+	float camera_position[4];
+	float light_direction[4]; // направление НА источник
+	float light_color[4];     // rgb -- цвет, w -- интенсивность
+	float ambient[4];         // rgb -- цвет, w -- интенсивность
+	float albedo[4];
+	float specular[4];        // rgb -- цвет блика, w -- коэффициент блика
 };
 
 constexpr uint32_t icosahedron_corner_count = 12; // уникальных вершин тела
@@ -87,15 +98,39 @@ constexpr uint16_t icosahedron_faces[icosahedron_vertex_count] = {
 };
 
 graphics::Buffer vertex_buffer;
+graphics::Buffer uniform_buffer;
+
+VkDescriptorSetLayout vk_set_layout = VK_NULL_HANDLE;
+VkDescriptorPool vk_descriptor_pool = VK_NULL_HANDLE;
+VkDescriptorSet vk_descriptor_set = VK_NULL_HANDLE;
 
 VkPipelineLayout vk_pipeline_layout = VK_NULL_HANDLE;
 VkPipeline vk_pipeline = VK_NULL_HANDLE;
 
-// Параметры сцены, которыми управляет интерфейс.
-bool use_perspective = true;
+// Камера: позиция в мире и два угла поворота. При нулевых углах она смотрит
+// вдоль -Z, то есть из точки {0, 0, 3} -- в начало координат.
+Vec3 camera_position = {0.0f, 0.0f, 3.0f};
+float camera_yaw = 0.0f;   // поворот вокруг вертикальной оси, градусы
+float camera_pitch = 0.0f; // наклон вверх-вниз, градусы
 float fov_degrees = 60.0f;
-float ortho_height = 1.4f;    // половина высоты области видимости
-float camera_distance = 3.0f;
+
+bool use_perspective = true;
+float ortho_height = 1.4f; // половина высоты области видимости
+
+// Направленный источник: светит с бесконечности, поэтому задаётся только
+// направлением. В интерфейсе задаётся направление НА источник.
+Vec3 light_direction = {-0.4f, 0.8f, 0.5f};
+float light_color[3] = {1.0f, 0.95f, 0.85f};
+float light_intensity = 1.0f;
+
+// Рассеянный свет -- приближение освещения, пришедшего со всех сторон.
+float ambient_color[3] = {0.45f, 0.55f, 0.8f};
+float ambient_intensity = 0.15f;
+
+// Материал по модели Блинн-Фонга.
+float material_albedo[3] = {0.75f, 0.3f, 0.22f};
+float material_specular[3] = {1.0f, 1.0f, 1.0f};
+float material_shininess = 48.0f;
 
 Vec3 object_position = {0.0f, 0.0f, 0.0f};
 Vec3 object_rotation = {0.0f, 0.0f, 0.0f}; // углы Эйлера в градусах
@@ -107,17 +142,19 @@ float auto_rotate_angle = 0.0f;
 
 double previous_time = 0.0;
 
-// Матрица, посчитанная в update() и использованная в render().
-Mat4 mvp = linalg::identity();
+// Данные, посчитанные в update() и записанные в буфер в render().
+Uniforms uniforms;
 
 // Вершинный буфер строится из таблицы координат и таблицы граней.
 //
 // Каждая грань получает собственные три вершины (20 * 3 = 60 штук), хотя
-// геометрически вершин всего 12. Это нужно, чтобы задать свой цвет для каждой
-// грани: соседние грани не могут делить одну вершину с разными цветами.
-// Цвет назначается процедурно -- по направлению на центр грани в локальной
-// системе координат фигуры. Без этого однотонный икосаэдр без освещения
-// выглядел бы плоским силуэтом.
+// геометрически вершин всего 12. Так у соседних граней в общей точке могут быть
+// разные нормали.
+//
+// Нормали считаются процедурно: нормаль вершины -- это нормаль её грани.
+// У выпуклого тела с центром в начале координат она совпадает с направлением
+// на центр грани. Такие нормали дают плоскогранную заливку: каждая грань
+// освещена равномерно, а блики ложатся по граням, а не как на сфере.
 void buildVertices(Vertex (&out_vertices)[icosahedron_vertex_count]) {
 	for (uint32_t face = 0; face < icosahedron_face_count; ++face) {
 		Vec3 positions[3];
@@ -130,14 +167,9 @@ void buildVertices(Vertex (&out_vertices)[icosahedron_vertex_count]) {
 		}
 
 		const Vec3 normal = linalg::normalize(center);
-		const Vec3 color = {
-			0.5f + 0.5f * normal.x,
-			0.5f + 0.5f * normal.y,
-			0.5f + 0.5f * normal.z,
-		};
 
 		for (uint32_t i = 0; i < 3; ++i) {
-			out_vertices[face * 3 + i] = {positions[i], color};
+			out_vertices[face * 3 + i] = {positions[i], normal};
 		}
 	}
 }
@@ -156,6 +188,89 @@ bool createGeometry() {
 	return true;
 }
 
+// Параметры камеры, света и материала не влезают в push-константы
+// (гарантированы 128 байт), поэтому они передаются через uniform-буфер.
+bool createDescriptors() {
+	auto& context = graphics::internal::context;
+
+	if (!graphics::createHostVisibleBuffer(sizeof(Uniforms),
+	                                       VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+	                                       uniform_buffer)) {
+		return false;
+	}
+
+	// Буфер читают оба шейдера: вершинный -- матрицы, фрагментный -- свет.
+	const VkDescriptorSetLayoutBinding binding = {
+		.binding = 0,
+		.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+		.descriptorCount = 1,
+		.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+	};
+
+	const VkDescriptorSetLayoutCreateInfo set_layout = {
+		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+		.bindingCount = 1,
+		.pBindings = &binding,
+	};
+
+	if (vkCreateDescriptorSetLayout(context.device, &set_layout, nullptr,
+	                                &vk_set_layout) != VK_SUCCESS) {
+		std::cerr << "Failed to create Vulkan descriptor set layout\n";
+		return false;
+	}
+
+	const VkDescriptorPoolSize pool_size = {
+		.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+		.descriptorCount = 1,
+	};
+
+	const VkDescriptorPoolCreateInfo descriptor_pool = {
+		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+		.maxSets = 1,
+		.poolSizeCount = 1,
+		.pPoolSizes = &pool_size,
+	};
+
+	if (vkCreateDescriptorPool(context.device, &descriptor_pool, nullptr,
+	                           &vk_descriptor_pool) != VK_SUCCESS) {
+		std::cerr << "Failed to create Vulkan descriptor pool\n";
+		return false;
+	}
+
+	const VkDescriptorSetAllocateInfo allocation = {
+		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+		.descriptorPool = vk_descriptor_pool,
+		.descriptorSetCount = 1,
+		.pSetLayouts = &vk_set_layout,
+	};
+
+	if (vkAllocateDescriptorSets(context.device, &allocation, &vk_descriptor_set) != VK_SUCCESS) {
+		std::cerr << "Failed to allocate Vulkan descriptor set\n";
+		return false;
+	}
+
+	// Набор связывается с буфером один раз: сам буфер потом не меняется,
+	// меняется только его содержимое.
+	const VkDescriptorBufferInfo buffer_info = {
+		.buffer = uniform_buffer.handle,
+		.offset = 0,
+		.range = sizeof(Uniforms),
+	};
+
+	const VkWriteDescriptorSet write = {
+		.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+		.dstSet = vk_descriptor_set,
+		.dstBinding = 0,
+		.descriptorCount = 1,
+		.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+		.pBufferInfo = &buffer_info,
+	};
+
+	vkUpdateDescriptorSets(context.device, 1, &write, 0, nullptr);
+
+	return true;
+}
+
 bool createPipeline() {
 	auto& context = graphics::internal::context;
 
@@ -167,18 +282,10 @@ bool createPipeline() {
 		return false;
 	}
 
-	// Матрица MVP передаётся через push-константы: 64 байта из гарантированных
-	// спецификацией 128, так что набор дескрипторов для неё не нужен.
-	const VkPushConstantRange push_constant_range = {
-		.stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
-		.offset = 0,
-		.size = sizeof(PushConstants),
-	};
-
 	const VkPipelineLayoutCreateInfo pipeline_layout = {
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-		.pushConstantRangeCount = 1,
-		.pPushConstantRanges = &push_constant_range,
+		.setLayoutCount = 1,
+		.pSetLayouts = &vk_set_layout,
 	};
 
 	bool ok = vkCreatePipelineLayout(context.device, &pipeline_layout, nullptr,
@@ -217,7 +324,7 @@ bool createPipeline() {
 				.location = 1,
 				.binding = 0,
 				.format = VK_FORMAT_R32G32B32_SFLOAT,
-				.offset = offsetof(Vertex, color),
+				.offset = offsetof(Vertex, normal),
 			},
 		};
 
@@ -320,6 +427,24 @@ bool createPipeline() {
 	return ok;
 }
 
+// Направление взгляда камеры по двум углам: yaw поворачивает вокруг
+// вертикальной оси, pitch наклоняет вверх-вниз.
+Vec3 cameraForward() {
+	const float yaw = linalg::radians(camera_yaw);
+	const float pitch = linalg::radians(camera_pitch);
+
+	return {
+		 std::sin(yaw) * std::cos(pitch),
+		 std::sin(pitch),
+		-std::cos(yaw) * std::cos(pitch),
+	};
+}
+
+Mat4 viewMatrix() {
+	const Vec3 forward = cameraForward();
+	return linalg::lookAt(camera_position, camera_position + forward, {0.0f, 1.0f, 0.0f});
+}
+
 // M = T * Rz * Ry * Rx * S -- сначала масштаб, затем повороты, затем перенос.
 Mat4 modelMatrix() {
 	const Mat4 rotation = linalg::rotationZ(linalg::radians(object_rotation.z)) *
@@ -348,13 +473,17 @@ Mat4 projectionMatrix() {
 void drawInterface() {
 	// Подписи интерфейса на латинице: шрифт ImGUI по умолчанию не содержит
 	// глифов кириллицы.
-	ImGui::Begin("Lab 1 / variant 11: regular icosahedron");
+	ImGui::Begin("Lab 2 / variant 11: regular icosahedron");
 
 	ImGui::Text("%.1f FPS", static_cast<double>(ImGui::GetIO().Framerate));
-	ImGui::Text("%u faces, %u vertices in the buffer (%u distinct corners)",
-	            icosahedron_face_count, icosahedron_vertex_count, icosahedron_corner_count);
+	ImGui::Text("%u faces, %u vertices with procedural normals",
+	            icosahedron_face_count, icosahedron_vertex_count);
 
-	ImGui::SeparatorText("Projection");
+	ImGui::SeparatorText("Camera");
+	ImGui::SliderFloat3("position", &camera_position.x, -10.0f, 10.0f, "%.2f");
+	ImGui::SliderFloat("yaw", &camera_yaw, -180.0f, 180.0f, "%.0f deg");
+	ImGui::SliderFloat("pitch", &camera_pitch, -89.0f, 89.0f, "%.0f deg");
+
 	int projection = use_perspective ? 0 : 1;
 	ImGui::RadioButton("perspective", &projection, 0);
 	ImGui::SameLine();
@@ -366,9 +495,29 @@ void drawInterface() {
 	} else {
 		ImGui::SliderFloat("view height", &ortho_height, 0.5f, 8.0f, "%.2f");
 	}
-	ImGui::SliderFloat("camera distance", &camera_distance, 2.0f, 20.0f, "%.2f");
 
-	ImGui::SeparatorText("Affine transformations");
+	if (ImGui::Button("Look at the object")) {
+		// Камера отъезжает по +Z и смотрит в начало координат.
+		camera_position = {0.0f, 0.0f, 3.0f};
+		camera_yaw = 0.0f;
+		camera_pitch = 0.0f;
+	}
+
+	ImGui::SeparatorText("Directional light");
+	ImGui::SliderFloat3("direction to light", &light_direction.x, -1.0f, 1.0f, "%.2f");
+	ImGui::ColorEdit3("light colour", light_color);
+	ImGui::SliderFloat("light intensity", &light_intensity, 0.0f, 4.0f, "%.2f");
+
+	ImGui::SeparatorText("Ambient light");
+	ImGui::ColorEdit3("ambient colour", ambient_color);
+	ImGui::SliderFloat("ambient intensity", &ambient_intensity, 0.0f, 1.0f, "%.2f");
+
+	ImGui::SeparatorText("Material");
+	ImGui::ColorEdit3("albedo", material_albedo);
+	ImGui::ColorEdit3("specular colour", material_specular);
+	ImGui::SliderFloat("shininess", &material_shininess, 1.0f, 256.0f, "%.0f");
+
+	ImGui::SeparatorText("Object");
 	ImGui::SliderFloat3("translation", &object_position.x, -3.0f, 3.0f, "%.2f");
 	ImGui::SliderFloat3("rotation", &object_rotation.x, -180.0f, 180.0f, "%.0f deg");
 	ImGui::SliderFloat3("scale", &object_scale.x, 0.1f, 3.0f, "%.2f");
@@ -390,7 +539,7 @@ void drawInterface() {
 } // namespace
 
 bool initialize() {
-	if (!createGeometry()) {
+	if (!createGeometry() || !createDescriptors()) {
 		return false;
 	}
 
@@ -404,6 +553,11 @@ void shutdown() {
 	vkDestroyPipeline(context.device, vk_pipeline, nullptr);
 	vkDestroyPipelineLayout(context.device, vk_pipeline_layout, nullptr);
 
+	// Набор дескрипторов уничтожается вместе с пулом, из которого выделен.
+	vkDestroyDescriptorPool(context.device, vk_descriptor_pool, nullptr);
+	vkDestroyDescriptorSetLayout(context.device, vk_set_layout, nullptr);
+
+	graphics::destroyBuffer(uniform_buffer);
 	graphics::destroyBuffer(vertex_buffer);
 }
 
@@ -420,12 +574,35 @@ void update(double time) {
 		}
 	}
 
-	// Камера смотрит в начало координат с положительной полуоси Z.
-	const Mat4 view = linalg::lookAt({0.0f, 0.0f, camera_distance},
-	                                 {0.0f, 0.0f, 0.0f},
-	                                 {0.0f, 1.0f, 0.0f});
+	const Mat4 model = modelMatrix();
 
-	mvp = projectionMatrix() * view * modelMatrix();
+	uniforms.model = model;
+	uniforms.view_projection = projectionMatrix() * viewMatrix();
+	uniforms.normal_matrix = linalg::normalMatrix(model);
+
+	// Позиция камеры нужна фрагментному шейдеру: от неё считается направление
+	// на наблюдателя, без которого не посчитать блик.
+	uniforms.camera_position[0] = camera_position.x;
+	uniforms.camera_position[1] = camera_position.y;
+	uniforms.camera_position[2] = camera_position.z;
+	uniforms.camera_position[3] = 1.0f;
+
+	const Vec3 direction = linalg::normalize(light_direction);
+	uniforms.light_direction[0] = direction.x;
+	uniforms.light_direction[1] = direction.y;
+	uniforms.light_direction[2] = direction.z;
+	uniforms.light_direction[3] = 0.0f;
+
+	for (int i = 0; i < 3; ++i) {
+		uniforms.light_color[i] = light_color[i];
+		uniforms.ambient[i] = ambient_color[i];
+		uniforms.albedo[i] = material_albedo[i];
+		uniforms.specular[i] = material_specular[i];
+	}
+	uniforms.light_color[3] = light_intensity;
+	uniforms.ambient[3] = ambient_intensity;
+	uniforms.albedo[3] = 1.0f;
+	uniforms.specular[3] = material_shininess;
 }
 
 void render(const graphics::internal::FrameData& fd) {
@@ -440,6 +617,11 @@ void render(const graphics::internal::FrameData& fd) {
 		.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
 	};
 	vkBeginCommandBuffer(cmd, &begin_info);
+
+	// Данные кадра пишутся здесь, а не в update(): к этому моменту
+	// graphics::internal::prepare() уже дождался, пока видеокарта закончит
+	// предыдущий кадр, поэтому буфер можно безопасно перезаписывать.
+	graphics::writeBuffer(uniform_buffer, &uniforms, sizeof(uniforms));
 
 	// 2. The values used to clear the color and depth images
 	const VkClearValue clear_values[] = {
@@ -477,9 +659,8 @@ void render(const graphics::internal::FrameData& fd) {
 	};
 	vkCmdSetScissor(cmd, 0, 1, &scissor);
 
-	const PushConstants push_constants = {.mvp = mvp};
-	vkCmdPushConstants(cmd, vk_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
-	                   sizeof(push_constants), &push_constants);
+	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk_pipeline_layout,
+	                        0, 1, &vk_descriptor_set, 0, nullptr);
 
 	const VkDeviceSize vertex_buffer_offset = 0;
 	vkCmdBindVertexBuffers(cmd, 0, 1, &vertex_buffer.handle, &vertex_buffer_offset);
