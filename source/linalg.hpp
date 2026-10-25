@@ -128,6 +128,56 @@ inline Mat4 rotationZ(float angle) {
 	return m;
 }
 
+// Матрица для нормалей: обратная транспонированная к блоку 3x3 матрицы модели.
+// Если фигуру растянуть неравномерно, то нормали, умноженные на саму model,
+// перестают быть перпендикулярны поверхности, а на эту матрицу -- остаются.
+inline Mat4 normalMatrix(const Mat4& m) {
+	const float a = m.c[0][0], b = m.c[1][0], c = m.c[2][0];
+	const float d = m.c[0][1], e = m.c[1][1], f = m.c[2][1];
+	const float g = m.c[0][2], h = m.c[1][2], i = m.c[2][2];
+
+	// Матрица алгебраических дополнений. Обратная матрица равна её
+	// транспонированной, поделённой на определитель, а нам нужна обратная
+	// транспонированная -- то есть сама матрица дополнений, делённая на него.
+	const float cofactors[3][3] = {
+		{   e * i - f * h, -(d * i - f * g),   d * h - e * g},
+		{-(b * i - c * h),   a * i - c * g, -(a * h - b * g)},
+		{   b * f - c * e, -(a * f - c * d),   a * e - b * d},
+	};
+
+	const float det = a * cofactors[0][0] + b * cofactors[0][1] + c * cofactors[0][2];
+
+	Mat4 r = identity();
+	if (det == 0.0f) {
+		return r; // вырожденный масштаб (ноль по какой-то оси)
+	}
+
+	for (int row = 0; row < 3; ++row) {
+		for (int column = 0; column < 3; ++column) {
+			r.c[column][row] = cofactors[row][column] / det;
+		}
+	}
+	return r;
+}
+
+// Поворот, который переводит ось Z в заданное направление. Нужен, чтобы
+// поставить конус прожектора вдоль направления его свечения.
+inline Mat4 orientation(Vec3 direction) {
+	const Vec3 forward = normalize(direction);
+
+	// Опорный вектор не должен быть параллелен направлению.
+	const Vec3 reference = (std::abs(forward.y) > 0.99f) ? Vec3{1.0f, 0.0f, 0.0f}
+	                                                     : Vec3{0.0f, 1.0f, 0.0f};
+	const Vec3 right = normalize(cross(reference, forward));
+	const Vec3 up = cross(forward, right);
+
+	Mat4 m = identity();
+	m.c[0][0] = right.x;   m.c[0][1] = right.y;   m.c[0][2] = right.z;
+	m.c[1][0] = up.x;      m.c[1][1] = up.y;      m.c[1][2] = up.z;
+	m.c[2][0] = forward.x; m.c[2][1] = forward.y; m.c[2][2] = forward.z;
+	return m;
+}
+
 // --- Camera and projections -------------------------------------------------
 
 // Right-handed view matrix: the camera sits in `eye` and looks at `target`.
